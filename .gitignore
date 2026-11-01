@@ -6,3 +6,4 @@ dist/
 *.spec
 # готовый .exe лежит в Releases на GitHub, а не в коде
 *.exe
+New Text Document.txt
