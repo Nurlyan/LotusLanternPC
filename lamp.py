@@ -7,11 +7,14 @@ import threading
 
 from bleak import BleakClient, BleakScanner
 
-from protocol import (LIGHT_MODE_CCT, LIGHT_MODE_NONE, LIGHT_MODE_RGB, SUPPORTED_PREFIXES, WRITE_CHAR,
-                      cmd_brightness, cmd_color, cmd_color_temp, cmd_mode, cmd_power, cmd_speed, for_device,
-                      is_encrypted_name)
+from protocol import (LIGHT_MODE_CCT, LIGHT_MODE_NONE, LIGHT_MODE_RGB, NOTIFY_CHAR, SUPPORTED_PREFIXES,
+                      WRITE_CHAR, cmd_brightness, cmd_color, cmd_color_temp, cmd_mode, cmd_power, cmd_speed,
+                      for_device, is_encrypted_name)
 
 log = logging.getLogger("LotusLanternPC.lamp")
+
+ACK_TIMEOUT = 0.6   # эхо от лампы приходит за 25–250 мс
+ACK_TRIES = 3       # столько раз повторяем команду без эха, потом считаем связь мёртвой и переподключаемся
 
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "LotusLanternPC")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
@@ -48,6 +51,11 @@ class Lamp:
         self.client: BleakClient | None = None
         self._pending: dict[str, bytes] = {}
         self._wake = asyncio.Event()
+        self._ack = asyncio.Event()
+        self._awaiting: bytes | None = None   # команда, эхо которой ждём
+        self._echo = False                     # лампа подтверждает команды (подписка на FFF4 удалась)
+        self._echo_seen = False                # в этом соединении эхо уже приходило
+        self._last_send = 0.0
         self._save_timer = None
         self.loop = asyncio.new_event_loop()
         threading.Thread(target=self.loop.run_forever, daemon=True).start()
@@ -155,6 +163,7 @@ class Lamp:
     async def _drop(self):
         c, self.client = self.client, None
         self.connected = False
+        self._echo = self._echo_seen = False
         if c:
             try:
                 await c.disconnect()
@@ -164,6 +173,7 @@ class Lamp:
 
     def _on_disconnect(self, client):
         if client is self.client:
+            log.info("связь с лампой потеряна")
             self.client = None
             self._status(False, "Связь потеряна, переподключаюсь…")
             self.loop.call_soon_threadsafe(self._wake.set)
@@ -197,6 +207,13 @@ class Lamp:
             raise RuntimeError("лампа не отвечает")
         self.client = client
         self.encrypted = is_encrypted_name(self.state.get("name"))
+        self._echo = self._echo_seen = False
+        if not self.encrypted:   # формат эха у шифрованных ламп неизвестен — шлём им как раньше, без проверки
+            try:
+                await client.start_notify(NOTIFY_CHAR, self._on_notify)
+                self._echo = True
+            except Exception as e:  # noqa: BLE001
+                log.info("лампа не даёт подписаться на подтверждения: %r", e)
         self._status(True, f"Подключено: {name}")
         # приложение шлёт яркость (с режимом палитры) при открытии экрана цвета — делаем так же
         self._submit("bright", self._brightness_cmd())
@@ -233,9 +250,61 @@ class Lamp:
             key = next(iter(self._pending))
             cmd = self._pending.pop(key)
             try:
-                await self.client.write_gatt_char(WRITE_CHAR, for_device(cmd, self.encrypted), response=False)
-            except Exception:  # noqa: BLE001
+                delivered = await self._send(cmd)
+            except Exception as e:  # noqa: BLE001
+                log.warning("запись в лампу не удалась: %r", e)
+                delivered = False
+            if not delivered:   # команда не потеряется: уйдёт после переподключения (если её не сменила новая)
                 self._pending.setdefault(key, cmd)
+                self._status(False, "Лампа не отвечает, переподключаюсь…")
                 await self._drop()
-                continue
+
+    async def _send(self, cmd) -> bool:
+        """Отправляет команду и ждёт её эхо от лампы; без эха повторяет.
+        False — лампа так и не ответила, связь мёртвая (Windows иногда ещё считает её живой)."""
+        data = for_device(cmd, self.encrypted)
+        if not self._echo:
+            await self.client.write_gatt_char(WRITE_CHAR, data, response=False)
             await asyncio.sleep(0.03)
+            return True
+        try:
+            for attempt in range(ACK_TRIES):
+                self._ack.clear()
+                self._awaiting = data
+                self._last_send = self.loop.time()
+                await self.client.write_gatt_char(WRITE_CHAR, data, response=False)
+                try:
+                    await asyncio.wait_for(self._ack.wait(), ACK_TIMEOUT)
+                    if attempt:
+                        log.info("команда %s дошла с %d-й попытки", cmd.hex(" "), attempt + 1)
+                    return True
+                except TimeoutError:
+                    pass
+        finally:
+            self._awaiting = None
+        if not self._echo_seen:   # эхо в этом соединении ни разу не приходило — видимо, лампа его не шлёт
+            log.info("лампа не присылает подтверждений — отправляю без проверки")
+            self._echo = False
+            return True
+        log.warning("лампа не подтвердила %s после %d попыток", cmd.hex(" "), ACK_TRIES)
+        return False
+
+    def _on_notify(self, _char, data: bytearray):
+        data = bytes(data)
+        self._echo_seen = True
+        if data == self._awaiting:
+            self._ack.set()
+            return
+        # не наше эхо — лампу переключили чем-то другим (пульт, телефон); подтягиваем состояние.
+        # Пока своя команда в пути (и секунду после) это может быть запоздалое эхо старой — не трогаем.
+        if self._awaiting is not None or self.loop.time() - self._last_send < 1.0:
+            return
+        if len(data) != 9 or data[0] != 0x7E or data[8] != 0xEF:
+            return
+        if data[1:3] == b"\x04\x04" and "power" not in self._pending and bool(data[3]) != self.state["on"]:
+            log.info("лампу %s не из программы", "включили" if data[3] else "выключили")
+            self._set(on=bool(data[3]))
+        elif data[1:4] == b"\x07\x05\x03" and "scene" not in self._pending:
+            rgb = list(data[4:7])
+            if self.state["scene"] != "color" or rgb != list(self.state["color"]):
+                self._set(color=rgb, scene="color")
