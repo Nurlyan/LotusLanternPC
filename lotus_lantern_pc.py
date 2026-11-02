@@ -121,6 +121,10 @@ class GlassApp:
         threading.Thread(target=self._pusher, name="push", daemon=True).start()
 
     def run(self):
+        # Спрятанная панель стоит за экраном; без этого Chromium счёл бы её закрытой и перестал рисовать.
+        # Переменная окружения важнее аргументов pywebview, поэтому его ElasticOverscroll повторяем.
+        os.environ["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = \
+            "--disable-features=ElasticOverscroll,CalculateNativeWinOcclusion"
         webview.start(gui="edgechromium", private_mode=False, storage_path=os.path.join(CONFIG_DIR, "webview"))
 
     # -------------------------------------------------- окно (WinForms под pywebview)
@@ -167,16 +171,51 @@ class GlassApp:
         user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
         user32.SetWindowLongPtrW(self._hwnd, -20, user32.GetWindowLongPtrW(self._hwnd, -20) | 0x80)
         form.Deactivate += EventHandler(lambda s, e: self._on_deactivate())
+        from System import Action
+        # не внутри самого сворачивания (WM_SIZE), а сразу после него
+        form.Resize += EventHandler(lambda s, e: form.BeginInvoke(Action(self._on_resize)))
+
+    def _on_resize(self):
+        """Панель свернули («Свернуть все», Win+M и т.п.) — сразу возвращаем её в спрятанное состояние,
+        иначе она застревала свёрнутой, и щелчок по значку ничего не открывал."""
+        if not ctypes.windll.user32.IsIconic(self._hwnd):
+            return
+        self._anim += 1                                   # остановить выезд/уезд, если шёл
+        self.visible = False
+        self._hidden_at = time.monotonic()
+        form = self.window.native
+        self._clip(form.Width, form.Height, 0)
+        self._unminimize(*self._park_pos(form.Width), form.Width, form.Height)
+        self._js("park(true)")
 
     def _park(self):
-        """Спрятанная панель не скрывается, а стоит за кромкой панели задач, обрезанная до нуля:
-        WebView2 не рисует скрытое окно, и при выезде оно было бы пустым."""
+        """Спрятанная панель не скрывается (WebView2 не рисует скрытое окно, и при выезде оно было бы
+        пустым), а стоит за пределами всех мониторов, обрезанная до нуля. Раньше она стояла прямо под
+        кромкой панели задач, и когда Windows на миг переставала учитывать регион (оверлеи вроде
+        VoiceOS), поверх трея вылезали чёрные куски окна."""
         form = self.window.native
-        l, t, r, b = work_area()
-        form.Left, form.Top = r - form.Width - MARGIN, b
         self._clip(form.Width, form.Height, 0)
+        ctypes.windll.user32.SetWindowPos(self._hwnd, None, *self._park_pos(form.Width), 0, 0, 0x0015)
         ctypes.windll.user32.ShowWindow(self._hwnd, 4)    # SW_SHOWNOACTIVATE — без кражи фокуса
         self._js("park(true)")
+
+    def _unminimize(self, x, y, w, h):
+        """Разворачивает свёрнутое окно сразу в (x, y): обычный restore ставит его туда,
+        где Windows сочтёт нужным (наша позиция за экраном ей «не нравится»)."""
+        from ctypes import wintypes as wt
+
+        class WINDOWPLACEMENT(ctypes.Structure):
+            _fields_ = [("length", wt.UINT), ("flags", wt.UINT), ("showCmd", wt.UINT),
+                        ("ptMin", wt.POINT), ("ptMax", wt.POINT), ("rcNormal", wt.RECT)]
+        wp = WINDOWPLACEMENT(ctypes.sizeof(WINDOWPLACEMENT), 0, 4)   # SW_SHOWNOACTIVATE
+        wp.rcNormal = wt.RECT(x, y, x + w, y + h)
+        ctypes.windll.user32.SetWindowPlacement(self._hwnd, ctypes.byref(wp))
+
+    @staticmethod
+    def _park_pos(w):
+        """Точка под всеми мониторами (ниже нижнего края виртуального экрана)."""
+        sm = ctypes.windll.user32.GetSystemMetrics
+        return work_area()[2] - w - MARGIN, sm(77) + sm(79) + 100   # SM_YVIRTUALSCREEN + SM_CYVIRTUALSCREEN
 
     def _clip(self, w, h, visible):
         """Скруглённая форма окна w×h, срезанная снизу до `visible` пикселей —
@@ -259,8 +298,9 @@ class GlassApp:
             def done():
                 if self.visible:                          # пока уезжало, панель открыли снова
                     return
-                self._js("park(true)")
                 user32 = ctypes.windll.user32
+                user32.SetWindowPos(self._hwnd, None, *self._park_pos(form.Width), 0, 0, 0x0015)
+                self._js("park(true)")
                 if user32.GetForegroundWindow() == self._hwnd.value:   # отдать фокус, чтобы ввод не уходил в невидимое окно
                     user32.SetForegroundWindow(user32.FindWindowW("Shell_TrayWnd", None))
             self._slide(form, form.Top, b, b, HIDE_MS, lambda p: p ** 3, done)  # ease-in cubic
